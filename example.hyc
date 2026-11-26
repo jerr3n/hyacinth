@@ -1,0 +1,1069 @@
+pkg main
+
+import (
+    "std/io"
+    "std/os"
+    "std/mem"
+    "std/math"
+    "std/img"
+    "std/time"
+    "std/sync"
+    "std/cpu"
+    "std/net/http"
+)
+
+/*
+=====================================================================
+ CHEAT SHEET (the whole language on one screen)
+=====================================================================
+
+ bindings     let x = 1         immutable
+              var x = 1         mutable
+              const X = 1       evaluated at compile time, always
+
+ types        name Type         (type after name, like Go)
+              []T  slice/list   [N]T fixed array (stack)   Map[K, V]
+              ?T   T or none    ^T   T or an error   E^T  T or an E
+              &'a T             a stored reference (level 2, rarely needed)
+              iter[T]           a lazy sequence; write one with `yield`
+
+ named types  type A B          new distinct type, same layout as B. A(b) / B(a) convert for free
+              type A = B        alias: just another name
+              opaque type A B   outside its module, only A's own methods exist
+              type A u8 in 0..24   range-checked integer (the compiler uses the range)
+              methods go in a { } body after the type, same as structs
+
+ ranges       0..10 excludes 10     0..=10 includes 10
+
+ params       fn f(x T)         read-only borrow (default; compiler picks copy vs pointer)
+              fn f(inout x T)   exclusive mutable access; caller writes f(&x)
+              fn f(take x T)    f owns x from now on
+
+ values       assignment is a logical COPY. heap data is copy-on-write,
+              and a value's last use is a MOVE, so copies are rare in practice.
+              channel sends and `spawn` captures always MOVE.
+              values are dropped right after their LAST USE (not at end of block),
+              so files close and channels hang up as early as possible.
+              fn drop(inout self) { }   custom cleanup, run automatically
+              keep x                    hold x alive until the end of the block
+
+ errors       throw .x          raise
+              try expr          propagate. ONE `try` covers every failing call in the expression
+              expr catch(e) {}  handle
+              expr ?? default   works on both ?T and ^T
+              expr note "..."   attach a note to an error on its way up
+              x?.y              optional chaining
+
+ context      every task carries one (deadline, cancellation, typed values),
+              inherited by everything it spawns. read it with the built-in `ctx`.
+              scope(timeout: 5s) { }    with KEY = v { }    ctx.check()    <-ctx.done()
+
+ loops        for x in xs       for i, x in xs       for inout x in xs
+              while cond        loop
+
+ matching     match x { .a{id, ..} => ..   n if n > 3 => ..   0..=9 => ..   [a, b, ..] => ..   _ => .. }
+              exhaustive. patterns also work in `if let` and `let ... else`.
+
+ operators    ^  is XOR, ~ is bitwise NOT, !  is logical NOT.
+              (`^` only means "error" in TYPE position, so no ambiguity)
+              integer overflow panics (debug AND release) unless proven impossible.
+              +% -% *%  wrap on purpose      +| -|  saturate
+
+ levels       0 simple   - everything above. no lifetimes, no GC.
+              1 shared   - `shared T`, `region` blocks, sync.Mutex / sync.Atomic
+              2 views    - structs holding references: struct Foo['a] { x &'a str }
+              3 metal    - `unsafe`, raw pointers, SIMD, @no_alloc
+              lock a module to a level with #![level(simple)]
+=====================================================================
+*/
+
+
+// =====================================================================
+// 1. CONSTANTS & COMPTIME
+// =====================================================================
+
+const MB         = 1 << 20
+const MAX_UPLOAD = 25 * MB
+const THUMB_SIZE = 256
+
+// `if` is an expression. there's no ternary.
+const DESKTOP = if os.target == .linux { "/home/jerren/Desktop" } else { "C:/Users/Jerren/Desktop" }
+
+// a `comptime` block runs at compile time; its return value is baked into the binary.
+const CRC_TABLE = comptime {
+    var t [256]u32                     // every type has a zero value; this is all zeros
+    for i in 0..256 {
+        var c = u32(i)
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xEDB88320 ^ (c >> 1) } else { c >> 1 }
+        }
+        t[i] = c
+    }
+    return t
+}
+
+// `extend` adds methods to any type, including built-ins.
+extend []byte {
+    pub fn crc32(self) u32 {
+        var c u32 = 0xFFFFFFFF
+        for b in self {
+            c = CRC_TABLE[(c ^ u32(b)) & 0xFF] ^ (c >> 8)   // any integer type can index
+        }
+        return ~c
+    }
+}
+
+// tests live next to the code. `tern test` runs them (in parallel).
+test "crc32" {
+    assert CRC_TABLE[1] == 0x77073096
+    assert b"123456789".crc32() == 0xCBF43926
+}
+
+
+// =====================================================================
+// 2. TYPES
+// =====================================================================
+
+pub struct Point {
+    pub x f64
+    pub y f64
+
+    pub fn len(self) f64 => math.sqrt(self.x*self.x + self.y*self.y)
+
+    // `inout self`: this method mutates the receiver.
+    pub fn scale(inout self, by f64) {
+        self.x *= by
+        self.y *= by
+    }
+
+    // operators are just methods.
+    pub fn +(self, o Point) Point => Point{x: self.x + o.x, y: self.y + o.y}
+}
+
+pub struct Size {
+    pub w int
+    pub h int
+
+    pub fn area(self) int => self.w * self.h
+}
+
+pub enum Format {
+    png
+    jpeg
+    webp
+
+    pub fn mime(self) str => match self {
+        .png  => "image/png"
+        .jpeg => "image/jpeg"
+        .webp => "image/webp"
+    }
+}
+
+pub struct Image {
+    use size Size              // composition: image.w, image.area() work directly
+    pub format Format
+    pub pixels []byte
+}
+
+// interfaces are structural (like Go): anything with these methods satisfies them.
+// methods that satisfy an interface are visible wherever the interface is, so no `pub` needed.
+pub interface Encoder {
+    fn encode(self, image Image) ^[]byte
+    fn format(self) Format
+}
+
+struct PngEncoder {
+    fn encode(self, image Image) ^[]byte => img.png.encode(image.pixels, image.w, image.h)
+    fn format(self) Format => .png
+}
+
+struct JpegEncoder {
+    quality int = 90           // default field values
+
+    fn encode(self, image Image) ^[]byte => img.jpeg.encode(image.pixels, image.w, image.h, self.quality)
+    fn format(self) Format => .jpeg
+}
+
+// enums can carry data.
+pub enum Job {
+    thumbnail{id str, path str}
+    resize{id str, path str, width int}
+    shutdown
+}
+
+pub struct Thumb {
+    pub id     str
+    pub format Format
+    pub bytes  []byte
+}
+
+
+// =====================================================================
+// 3. NAMED TYPES
+// =====================================================================
+/*
+ type A B          a NEW type with B's layout. not interchangeable with B.
+                   converting either way is explicit and free: A(b), B(a).
+                   keeps B's methods and operators (u.len works on a UserId).
+ type A = B        an alias. nothing changes, it's only a name.
+ opaque type A B   outside this module, ONLY A's own methods exist, and A(..) is private.
+                   use it for types with rules: validated emails, sanitized paths, checked sizes.
+ type A B in r     a ranged integer. literals are checked at compile time; runtime values
+                   are checked once at the boundary (A(x) gives ^A). after that, the
+                   compiler knows the bounds everywhere the value goes.
+ untyped literals flow into named types, like Go: `let t Ms = 500`.
+*/
+
+type UserId  str
+type ImageId str
+
+type Bytes   = []byte
+type Pair[T] = (T, T)
+
+type Ms int {
+    pub fn seconds(self) f64 => f64(self) / 1000
+}
+
+type Celsius f64 {
+    pub fn to_fahrenheit(self) f64 => f64(self) * 9 / 5 + 32
+}
+
+pub error EmailError {
+    invalid "Not a valid email address."
+}
+
+opaque type Email str {
+    // the only way to get an Email from another module is through `parse`,
+    // so every Email in the program has been validated. in memory it's still just a str.
+    pub fn parse(s str) EmailError^Email {
+        let (user, domain) = s.split_once("@") ?? throw .invalid
+        if user.len == 0 || !domain.contains(".") { throw .invalid }
+        return Email(s)
+    }
+
+    pub fn domain(self) str => str(self).split_once("@")?.1 ?? ""
+}
+
+type Port u16 in 1..=65535
+type Hour u8  in 0..24
+
+struct Upload {
+    owner UserId
+    image ImageId
+    hour  Hour
+    bytes int
+}
+
+// `u.hour` is an Hour, so it's always in 0..24 and indexing a [24]int never needs a check.
+fn uploads_by_hour(log []Upload) [24]int {
+    var counts [24]int
+    for u in log {
+        counts[u.hour] += 1
+    }
+    return counts
+}
+
+fn delete_image(owner UserId, image ImageId) {
+    print("deleting {image} for {owner}")
+}
+
+fn named_types_demo() ^void {
+    let u = UserId("jerren")
+    let i = ImageId("a8f3c2")
+    // delete_image(i, u)          // ✗ compile error: expected UserId, got ImageId
+    delete_image(u, i)
+    delete_image("jerren", "a8f3c2")   // ✓ untyped literals are fine
+
+    // let raw str = u             // ✗ no implicit conversion
+    let raw = str(u)               // ✓ explicit and free
+    print("{raw} has {u.len} chars")   // UserId keeps str's methods
+
+    let t Ms = 1500
+    print("{t.seconds()}s")        // 1.5s
+
+    let email = try Email.parse("jerren@cate.host")
+    print(email.domain())          // cate.host
+    // from another module:  Email("not an email")   ✗ compile error: Email(..) is private
+
+    let https Port = 443           // checked at compile time
+    // let bad Port = 0            // ✗ compile error: 0 is outside Port's range 1..=65535
+    let port = try Port(os.env("PORT")?.parse_int() ?? 8080)   // runtime value: checked once, here
+    print("listening on {port}, fallback {https}")
+}
+
+
+// =====================================================================
+// 4. ERRORS & OPTIONALS
+// =====================================================================
+
+// `error` is an enum that can be thrown. each variant carries its message,
+// and variants can hold data that the message interpolates.
+pub error UploadError {
+    empty                "File was empty."
+    too_large(size int)  "File was too large ({size / MB} MB, max {MAX_UPLOAD / MB} MB)."
+    bad_format           "Unrecognized image format."
+}
+
+fn sniff(data []byte) ?Format {
+    if data.starts_with(b"\x89PNG") { return .png }      // b"..." is a []byte literal
+    if data.starts_with(b"\xFF\xD8") { return .jpeg }
+    if data.len >= 12 && data[0..4] == b"RIFF" && data[8..12] == b"WEBP" { return .webp }
+    return none
+}
+
+// return type `^Image`: the compiler infers the error set (UploadError | img.DecodeError).
+fn decode_upload(data []byte) ^Image {
+    if data.len == 0          { throw .empty }
+    if data.len > MAX_UPLOAD  { throw .too_large(data.len) }
+
+    let format = sniff(data) ?? throw .bad_format        // `throw` is an expression
+    return try img.decode(data, format)
+}
+
+fn errors_demo(path str) {
+    // handle an error right here
+    let data = io.read_file(path) catch(e) {
+        print("couldn't read {path}: {e}")
+        return
+    }
+
+    // fall back to a default (works on ^T and ?T)
+    let retries = os.env("RETRIES")?.parse_int() ?? 3
+
+    // match on success/failure, down to a specific error variant
+    match decode_upload(data) {
+        ok(image)           => print("decoded {image.w}x{image.h}")
+        err(.too_large(n))  => print("too big by {(n - MAX_UPLOAD) / MB} MB")
+        err(e)              => print("failed: {e}")
+    }
+
+    // optionals
+    let mime = sniff(data)?.mime() ?? "application/octet-stream"
+    if let f = sniff(data) { print("format: {f}") }
+    let f = sniff(data) else { return }                  // unwrap or bail
+    print("{mime} {f} {retries}")
+}
+
+// `note` attaches a message to an error on its way up (like Go's fmt.Errorf("...: %w", err)):
+//   error: No such file or directory
+//     note: reading /tmp/cat.png
+fn read_upload(path str) ^Image {
+    return try decode_upload(io.read_file(path)) note "reading {path}"
+}
+
+
+// =====================================================================
+// 5. PATTERN MATCHING
+// =====================================================================
+// `match` is exhaustive: forget a case and it won't compile.
+// arms are checked top to bottom; `if` adds a guard; `..` ignores the rest.
+
+fn describe(s Size) str => match s {
+    {w: 0, ..} | {h: 0, ..}     => "empty"
+    {w, h} if w == h            => "{w}px square"
+    {w: 0..=256, h: 0..=256}    => "small"
+    {w, h} if w > h * 2         => "panorama"
+    _                           => "{s.w}x{s.h}"
+}
+
+fn route(job Job) str => match job {
+    .thumbnail{id, ..}          => "thumbnail {id}"
+    .resize{width: 0..=64, ..}  => "tiny resize"
+    .resize{id, width, ..}      => "resize {id} to {width}px"
+    .shutdown                   => "shutdown"
+}
+
+fn summarize(xs []int) str => match xs {
+    []                          => "nothing"
+    [x]                         => "just {x}"
+    [a, b]                      => "{a} and {b}"
+    [first, .., last]           => "{first} to {last} ({xs.len} items)"
+}
+
+// nested patterns, through errors and optionals
+fn status(res UploadError^?Thumb) str => match res {
+    ok(some(t)) if t.bytes.len > MB => "{t.id}: large"
+    ok(some(t))                     => "{t.id}: ok"
+    ok(none)                        => "skipped"
+    err(.too_large(n))              => "too large ({n / MB} MB)"
+    err(e)                          => "failed: {e}"
+}
+
+// patterns work outside `match` too
+fn resize_width(job Job) ?int {
+    let .resize{width, ..} = job else { return none }
+    return width
+}
+
+fn first_png(paths []str) ?str {
+    for p in paths {
+        if let [.., "png"] = p.split(".") { return p }
+    }
+    return none
+}
+
+
+// =====================================================================
+// 6. VALUE SEMANTICS, BORROWS, MOVES, CLEANUP
+// =====================================================================
+
+fn value_semantics_demo() {
+    var a = [1, 2, 3]
+    var b = a                  // b is its own value (copy-on-write, so no copy yet)
+    b.append(4)                // b gets its own buffer now; a is untouched
+    print("{a} {b}")           // [1, 2, 3] [1, 2, 3, 4]
+
+    bump(&a, 10)               // `&` at the call site: "this call may change a"
+    print("{a}")               // [11, 12, 13]
+
+    var p = Point{x: 3, y: 4}
+    p.scale(2)                 // methods with `inout self` don't need `&` (like Swift)
+    print("{p.len():.1}")      // 10.0   (format specs go after a colon)
+    print("{p:?}")             // Point{x: 6.0, y: 8.0}   (`:?` = debug print, see `debug` below)
+
+    var ps = [Point{x: 1, y: 1}, Point{x: 2, y: 2}]
+    for inout q in ps {        // mutate elements in place, no indexing
+        q.scale(10)
+    }
+}
+
+fn bump(inout xs []int, n int) {
+    for inout x in xs {
+        x += n
+    }
+}
+
+fn ownership_demo() {
+    let image = Image{size: Size{w: 800, h: 600}, format: .png, pixels: []}
+    archive(image)             // last use of `image`, so it's MOVED: zero copies
+    // print(image.w)          // ✗ compile error: `image` was moved into `archive` above
+    //                         //   help: use `archive(image.copy())` to keep your own
+}
+
+fn archive(take image Image) {
+    // this function owns `image`; it's freed when this function is done with it
+}
+
+// custom cleanup: `drop` runs automatically right after a value's last use.
+// drop can't fail, so it handles its own errors.
+struct TempFile {
+    pub path str
+
+    fn drop(inout self) {
+        io.remove(self.path) catch(_) {}
+    }
+}
+
+fn temp_demo() ^void {
+    let tmp = TempFile{path: "/tmp/upload_{time.now().unix_nanos()}"}
+    try io.write_file(tmp.path, b"scratch")
+    print("{try io.read_file(tmp.path).len} bytes")
+}   // tmp's last use was the line above, so the file was removed right there
+
+// `keep` holds a value alive to the end of the block, for things you hold
+// for their side effect and never touch again (a lock file, a timer, a guard).
+fn exclusive_job() ^void {
+    let lock = try sync.FileLock("/tmp/thumbs.lock")
+    keep lock                  // without this, `lock` would be dropped right here (never used again)
+    try regenerate_all()
+}   // released here
+
+fn regenerate_all() ^void {
+    // ...
+}
+
+
+// =====================================================================
+// 7. EVERYDAY ERGONOMICS
+// =====================================================================
+
+// default + named arguments (same syntax as struct fields)
+fn thumb_name(id str, width int = THUMB_SIZE, format Format = .webp) str =>
+    "{id}_{width}.{format}"
+
+fn ergonomics_demo() {
+    print(thumb_name("cat"))                          // cat_256.webp
+    print(thumb_name("cat", format: .png))            // cat_256.png
+
+    // closures
+    let sizes   = [64, 128, 256]
+    let doubled = sizes.map(fn(x) => x * 2)
+    let big     = sizes.filter(fn(x) => x > 100)
+    let total   = sizes.sum()
+
+    // tuples and multiple returns
+    let (lo, hi) = min_max(sizes)
+
+    // slices and ranges
+    let tail  = sizes[1..]                            // [128, 256]
+    let first = sizes.first() ?? 0
+
+    // map literals
+    var counts = Map[str, int]{"png": 0, "jpeg": 0}
+    counts["png"] += 1
+
+    // struct literal shorthand: `id` means `id: id`
+    let id = "abc"
+    let t  = Thumb{id, format: .png, bytes: []}
+
+    // durations are literals
+    let timeout = 1500ms
+
+    print("{doubled} {big} {total} {lo}..{hi} {tail} {first} {counts} {t.id} {timeout}")
+}
+
+fn min_max(xs []int) (int, int) {
+    var lo = xs[0]
+    var hi = xs[0]
+    for x in xs[1..] {
+        lo = math.min(lo, x)
+        hi = math.max(hi, x)
+    }
+    return (lo, hi)
+}
+
+// resources close themselves when they're dropped (after their last use).
+// `defer` is still there for things that aren't resources.
+fn append_log(line str) ^void {
+    let start = time.now()
+    defer print("log write took {time.since(start)}")
+
+    var f = try io.open("uploads.log", .append)
+    try f.write("{line}\n")
+}   // `f` was already closed right after its last use above; no `defer f.close()` needed
+
+
+// =====================================================================
+// 8. GENERICS, INTERFACES, ITERATORS, COMPTIME
+// =====================================================================
+
+fn largest[T: Ord](xs []T) ?T {
+    var best ?T = none
+    for x in xs {
+        if best == none || x > best? { best = x }
+    }
+    return best
+}
+
+// an interface type as a parameter is STATIC by default: the compiler makes a
+// specialized copy per concrete type, so `enc.encode` is a direct, inlinable call.
+fn save(enc Encoder, image Image, path str) ^void {
+    try io.write_file(path, enc.encode(image))
+}
+
+// `dyn` when you actually need a mix of types at runtime (one vtable call per use).
+fn encode_all(image Image) ^[][]byte {
+    let encoders []dyn Encoder = [PngEncoder{}, JpegEncoder{quality: 80}]
+    return try encoders.map(fn(e) => e.encode(image))
+}
+
+// comptime reflection: this is how `{x:?}` printing works under the hood.
+// it costs nothing at runtime; it unrolls into one print per field.
+fn debug[T](x T) {
+    print("{T.name} {{")
+    comptime for f in T.fields {
+        print("  {f.name} = {x.[f.name]}")
+    }
+    print("}}")
+}
+
+// --- iterators ------------------------------------------------------------
+// any type with `fn next(inout self) ?T` works in a `for` loop
+// (the `Words` splitter in the speed section is one).
+//
+// generators: `yield` turns a function into an iterator. it compiles to a small
+// state-machine struct: no heap allocation, no threads, and it inlines like a
+// hand-written loop.
+fn chunks(data []byte, size int) iter[[]byte] {
+    var i = 0
+    while i < data.len {
+        yield data[i..math.min(i + size, data.len)]
+        i += size
+    }
+}
+
+fn fib() iter[u64] {
+    var (a, b) = (u64(0), u64(1))
+    loop {
+        yield a
+        (a, b) = (b, a + b)
+    }
+}
+
+fn iter_demo() {
+    for c in chunks(b"hello world", 4) {
+        print("{c.len}")                                   // 4 4 3
+    }
+
+    // iterator chains are lazy and fuse into ONE loop at compile time:
+    // no intermediate lists, no closures left at runtime.
+    let first10 = fib().take(10).collect()                 // [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+    let even_sum = fib().filter(fn(x) => x % 2 == 0).take(5).sum()
+    print("{first10} {even_sum}")
+}
+
+test "fib" {
+    assert fib().take(10).collect() == [0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+}
+
+
+// =====================================================================
+// 9. SPEED (levels 1-3). none of this is needed for correct code.
+//    it's here for when you want the last 2x.
+// =====================================================================
+
+// --- regions: arena allocation as a block --------------------------
+// everything allocated inside is bump-allocated and freed in one shot.
+// a value escaping the region must be `.copy()`'d out; anything else is a compile error.
+fn handle_upload(req http.Request) ^http.Response {
+    region {
+        let form  = try req.parse_multipart()
+        let image = try decode_upload(form["file"])
+        let small = img.resize(image, THUMB_SIZE, image.h * THUMB_SIZE / image.w)
+        let bytes = try JpegEncoder{}.encode(small)
+        return http.Response{status: 200, body: bytes.copy()}
+    }
+}
+
+// --- data layout: change memory layout without changing code ---------
+// .soa stores this as pos.x[], pos.y[], vel.x[], ... instead of an array of structs.
+// the loop below is written the same way either way, but auto-vectorizes with .soa.
+@layout(.soa)
+struct Particle {
+    pos  Point
+    vel  Point
+    mass f64
+}
+
+fn step(inout ps []Particle, dt f64) {
+    for inout p in ps {
+        p.pos.x += p.vel.x * dt
+        p.pos.y += p.vel.y * dt
+    }
+}
+
+// --- bounds checks: proven away, not turned off ----------------------
+fn add_into(inout dst []f32, src []f32) {
+    assert dst.len == src.len       // one check up front...
+    for i in dst.indices {          // ...and `i` is a proven-in-range index type,
+        dst[i] += src[i]            // so neither access is checked inside the loop
+    }
+}
+
+// --- SIMD ------------------------------------------------------------
+@inline
+fn dot(a []f32, b []f32) f32 {
+    assert a.len == b.len
+    let n = a.len - a.len % 8
+    var acc = f32x8.splat(0)
+    for i in (0..n).step(8) {
+        acc += f32x8.load(a[i..]) * f32x8.load(b[i..])
+    }
+    var sum = acc.sum()
+    for i in n..a.len { sum += a[i] * b[i] }          // leftover tail
+    return sum
+}
+
+// --- compile-time specialization ---------------------------------------
+fn checksum(data []byte) u32 {
+    comptime if cpu.has(.sse42) {
+        return cpu.crc32c_hw(data)                    // only compiled in on CPUs that have it
+    } else {
+        return data.crc32()
+    }
+}
+
+// --- allocation guarantees -------------------------------------------
+@no_alloc    // compile error if this, or anything it calls, touches the heap
+fn sum_lengths(chunks [][]byte) int {
+    var n = 0
+    for c in chunks { n += c.len }
+    return n
+}
+
+// --- integer overflow ---------------------------------------------------
+// plain + - * panic on overflow in debug AND release, unlike Rust's release builds,
+// which wrap silently. the compiler removes every check it can prove unnecessary,
+// and ranged types (section 3) make that most of them.
+// when you WANT wrapping or saturation, say so:
+fn fnv1a(data []byte) u64 {
+    var h u64 = 0xcbf29ce484222325
+    for b in data {
+        h = (h ^ u64(b)) *% 0x100000001b3            // `*%` wraps on purpose
+    }
+    return h
+}
+
+fn brighten(px u8, by u8) u8 => px +| by             // saturating: 250 +| 10 == 255
+
+fn safe_total(a int, b int) ?int => a.checked_add(b) // none instead of a panic
+
+test "overflow ops" {
+    assert fnv1a(b"") == 0xcbf29ce484222325
+    assert brighten(250, 10) == 255
+    assert safe_total(int.max, 1) == none
+}
+
+// --- benchmarks live next to the code too: `tern bench` --------------------
+bench "crc32, 1 MB" (b) {
+    let data = []byte.filled(MB, 0xAB)
+    b.bytes(MB)                                      // report throughput in MB/s
+    b.loop(fn() => data.crc32())
+}
+
+// --- shared ownership (level 1) --------------------------------------
+// `shared T` is reference-counted and immutable. the compiler picks
+// non-atomic refcounts if the value never crosses tasks, atomic if it does.
+fn shared_demo() ^void {
+    let logo = shared try io.read_file("logo.png")
+    scope {
+        for i in 0..4 {
+            spawn upload_copy(logo, "logo_{i}.png")   // crosses tasks, so atomic rc, chosen for you
+        }
+    }
+}
+
+fn upload_copy(data shared []byte, name str) ^void {
+    try io.write_file("{DESKTOP}/{name}", data)
+}
+
+// --- projections: return a borrow with zero annotations ------------------
+pub struct Gallery {
+    pub images []Image
+
+    // `view` = borrowed from `self`. callers can use it but not store it,
+    // so there's nothing to annotate and it can never dangle.
+    pub fn largest(self) ?view Image => self.images.max_by(fn(i) => i.area())
+}
+
+// --- stored references (level 2): the ONLY place lifetimes show up ---------
+// a zero-copy word splitter that holds a reference to its input.
+pub struct Words['src] {
+    text &'src str
+    pos  int
+
+    pub fn next(inout self) ?&'src str {
+        while self.pos < self.text.len && self.text[self.pos] == b' ' { self.pos += 1 }
+        if self.pos >= self.text.len { return none }
+        let start = self.pos
+        while self.pos < self.text.len && self.text[self.pos] != b' ' { self.pos += 1 }
+        return &self.text[start..self.pos]            // a slice of the original: no copy
+    }
+}
+
+// --- metal (level 3) ---------------------------------------------------
+fn zero(inout buf []byte) {
+    unsafe {
+        mem.set(buf.ptr, 0, buf.len)                  // raw pointer; you promise it's valid
+    }
+}
+
+
+// =====================================================================
+// 10. CONCURRENCY
+// =====================================================================
+/*
+ tasks
+   - `spawn` starts a lightweight task (M:N scheduled across cores, like goroutines).
+   - blocking I/O just parks the task. there is no async/await and no "function colors":
+     any function can be called from any task.
+   - the compiler computes each task's max stack size when it can (no recursion or
+     dynamic dispatch on the path), so most tasks get an exactly-sized stack instead
+     of a growable one.
+   - with #![no_runtime] (embedded, kernels), `spawn` maps to OS threads and everything
+     else still works.
+
+ structure
+   - `spawn` only works inside a `scope { }`. a scope waits for all of its tasks.
+   - if any task fails (returns an error), its siblings are cancelled and the
+     error comes out of the scope, so `try scope { }` just works.
+   - `scope(timeout: 5s) { }` cancels everything still running after 5s.
+   - cancelled tasks see `.cancelled` from their next blocking call.
+
+ context (Go's context.Context, without passing it everywhere)
+   - every task has a context: an optional deadline, a cancellation signal,
+     and typed values. `spawn` inherits the current one automatically.
+   - `scope(timeout: ..)` / `scope(deadline: ..)` narrow it for everything inside.
+   - read it with the built-in `ctx`:
+       ctx.check()       throws .cancelled if cancelled or past the deadline
+       ctx.done()        a channel that fires on cancellation (for `select`)
+       ctx.deadline()    ?time.Instant
+       ctx.get(KEY)      ?T, using a typed key, so there's no casting
+       ctx.current()     the context as a value, to pass around explicitly
+   - `with KEY = value { }` sets a value for everything inside, spawned tasks included.
+   - `scope(ctx: .background) { }` detaches work that must outlive a cancellation.
+   - `scope(ctx: c) { }` runs under a context you were handed (explicit Go style).
+   - cost: one pointer in task-local storage. code that never reads `ctx` pays nothing.
+     cancellation is cooperative: std blocking calls check it, hot loops call ctx.check().
+
+ sharing (data races are compile errors)
+   - tasks may READ anything from outside the scope (it's guaranteed to outlive them).
+   - tasks may NOT mutate outside variables. for that use:
+       channels      move data between tasks
+       sync.Mutex[T] the mutex OWNS the data; `lock m as inout x { }` to touch it
+       sync.Atomic[T]
+   - channel sends MOVE. after `tx <- buf`, the sender can't use `buf`.
+
+ channels
+   - `let (tx, rx) = chan[T](cap: 64)` makes a sender/receiver pair.
+   - both ends can be copied (many senders, many receivers).
+   - a channel closes when its last sender is dropped, so `for x in rx`
+     ends by itself. there's no manual close().
+*/
+
+fn worker(jobs rx chan[Job], results tx chan[^Thumb], enc Encoder) {
+    for job in jobs {                                 // ends when `jobs` closes
+        match job {
+            .thumbnail{id, path}     => results <- make_thumb(id, path, THUMB_SIZE, enc)
+            .resize{id, path, width} => results <- make_thumb(id, path, width, enc)
+            .shutdown                => return
+        }
+    }
+}
+
+fn make_thumb(id str, path str, width int, enc Encoder) ^Thumb {
+    let image = try read_upload(path)
+    let small = img.resize(image, width, image.h * width / image.w)
+    return Thumb{id, format: enc.format(), bytes: try enc.encode(small)}
+}
+
+fn move_demo(out tx chan[[]byte]) ^void {
+    let buf = try io.read_file("hello.png")
+    out <- buf                 // buf moves into the channel: only a pointer is passed
+    // print(buf.len)          // ✗ compile error: `buf` was moved into `out` above
+}
+
+fn race_demo() {
+    var count = 0
+    scope {
+        // spawn { count += 1 }
+        //   ✗ compile error: `count` is mutated by a spawned task
+        //     help: use `sync.Atomic[int]` or `sync.Mutex[int]`, or send results over a channel
+    }
+
+    let hits = sync.Atomic[int](0)
+    scope {
+        for _ in 0..8 {
+            spawn { for _ in 0..1000 { hits.add(1) } }
+        }
+    }
+    assert hits.load() == 8000
+
+    // the mutex owns the map. `c` only exists inside the block,
+    // so you can't forget to unlock or keep a reference after unlocking.
+    let cache = sync.Mutex[Map[str, int]]{}
+    scope {
+        for name in ["a", "b", "c"] {
+            spawn {
+                lock cache as inout c { c[name] = name.len }
+            }
+        }
+    }
+    print("{count} {cache.into_inner()}")
+}
+
+// `select` waits on several channel operations at once.
+fn watchdog(heartbeats rx chan[str]) {
+    loop {
+        select {
+            name = <-heartbeats  => print("{name} is alive")
+            <-time.after(5s)     => { print("no heartbeat for 5s"); return }
+            <-ctx.done()         => return            // our scope was cancelled or timed out
+        }
+    }
+}
+
+// --- context ------------------------------------------------------------
+
+// no ctx parameter: http.get sees the deadline from the surrounding scope
+// and throws .cancelled once it passes.
+fn fetch(url str) ^[]byte {
+    return try http.get(url)
+}
+
+fn fetch_all(urls []str) ^void {
+    try scope(timeout: 5s) {
+        for url in urls {
+            spawn fetch(url)
+        }
+    }
+}
+
+// CPU-bound loops check in themselves; blocking calls do it for you.
+fn crunch(data []byte) ^u32 {
+    var h u32 = 0
+    for i, b in data {
+        if i % 4096 == 0 { try ctx.check() }
+        h = h *% 31 +% u32(b)                        // a hash: wrapping is intended
+    }
+    return h
+}
+
+// typed values: no `any`, no casts.
+const REQUEST_ID = ctx.key[str]("request_id")
+
+fn handle(req http.Request) ^http.Response {
+    with REQUEST_ID = req.header("X-Request-Id") ?? new_request_id() {
+        log("upload started")
+        return try handle_upload(req)               // everything in here sees REQUEST_ID
+    }
+}
+
+fn log(msg str) {
+    let id = ctx.get(REQUEST_ID) ?? "-"
+    if let d = ctx.deadline() {
+        print("[{id}] {msg} ({d - time.now()} left)")
+    } else {
+        print("[{id}] {msg}")
+    }
+}
+
+fn new_request_id() str => "req_{time.now().unix_nanos()}"
+
+// detach: this must finish even if the request that triggered it is cancelled.
+fn record_upload(name str) {
+    scope(ctx: .background) {
+        spawn append_log("uploaded {name}")
+    }
+}
+
+// fully explicit Go style, for libraries that want it.
+fn fetch_with(c Context, url str) ^[]byte {
+    try scope(ctx: c.with_timeout(2s)) {
+        return try http.get(url)
+    }
+}
+
+fn explicit_demo() ^void {
+    let c = ctx.current()                           // the current context as a value
+    let page = try fetch_with(c, "https://example.com")
+    print("{page.len} bytes")
+}
+
+// task handles: when you want a value back from one task
+fn handle_demo() ^void {
+    scope {
+        let a = spawn read_upload("a.png")
+        let b = spawn read_upload("b.png")
+        let (ia, ib) = (try a.wait(), try b.wait())   // both run in parallel
+        print("{ia.area() + ib.area()} pixels")
+    }
+}
+
+// data parallelism: split work across cores without writing tasks yourself
+fn checksums(files [][]byte) []u32 => files.par_map(fn(f) => f.crc32())
+
+test "parallel checksums" {
+    assert checksums([b"123456789"]) == [0xCBF43926]
+}
+
+
+// =====================================================================
+// 11. PACKAGES, VISIBILITY, INTEROP, TOOLING
+// =====================================================================
+/*
+ packages
+   - one folder = one package; the `pkg` line names it.
+   - imports are paths: "std/io", "cate/storage", "github.com/someone/lib".
+     remote imports are fetched and pinned in a lockfile, like Go modules.
+   - `import png "std/img/png"` renames an import.
+
+ visibility
+   - private to the package by default.
+   - `pub`        visible to anyone who imports the package.
+   - `pub(mod)`   visible to every package in THIS project, but not to outside users.
+                  (for helpers your own packages share but you don't want to support publicly)
+
+ interop
+   - `extern "C"` declares C functions. calling one is `unsafe` (the compiler can't check C).
+   - `import c "zlib.h"` reads a C header directly, so there are no hand-written bindings.
+   - `@export("C")` exposes a function with the C ABI, so C, Python, Go, etc. can call it.
+
+ tooling (one binary, like `go`)
+   - tern run | build | test | bench | fmt | doc
+   - debug builds use a fast backend (Cranelift-style) with every check on, for quick compiles.
+   - release builds use LLVM with whole-program optimization; `--profile` adds PGO.
+   - `tern build --explain-costs` lists every implicit copy, refcount, heap allocation and
+     bounds check left in the binary, per line: the "where did my speed go" report.
+   - `tern fmt` has no options. there's one style.
+*/
+
+@link("z")
+extern "C" fn crc32(crc u64, buf *u8, len u32) u64           // from zlib
+
+fn zlib_crc(data []byte) u32 {
+    return u32(unsafe { crc32(0, data.ptr, u32(data.len)) })
+}
+
+test "zlib agrees with ours" {
+    assert zlib_crc(b"123456789") == b"123456789".crc32()
+}
+
+@export("C")
+pub fn thumb_size() int => THUMB_SIZE                       // callable from C as `thumb_size()`
+
+// shared between this project's packages, hidden from outside users
+pub(mod) fn thumb_path(id str, format Format) str => "{DESKTOP}/thumbs/{id}.{format}"
+
+
+// =====================================================================
+// 12. PUTTING IT TOGETHER: a parallel thumbnail generator
+//    usage: thumbs cat.png dog.jpg ...
+// =====================================================================
+
+struct Stats {
+    ok     int
+    failed int
+    errors []str
+}
+
+fn main() ^void {
+    let paths = os.args()[1..]
+    if paths.len == 0 {
+        print("usage: thumbs <images...>")
+        return
+    }
+
+    let (job_tx, job_rx) = chan[Job](cap: 64)
+    let (res_tx, res_rx) = chan[^Thumb](cap: 64)
+    var stats = Stats{}                               // zero value: 0, 0, []
+    let start = time.now()
+
+    try scope(timeout: 60s) {
+        // workers: one per core, each gets its own copy of the channel ends.
+        // JpegEncoder is a concrete type, so `worker` is specialized for it (static dispatch).
+        for _ in 0..os.cpu_count() {
+            spawn worker(job_rx, res_tx, JpegEncoder{quality: 85})
+        }
+        // main's own `res_tx` is dropped here (after its last use), so when the
+        // workers finish, `res_rx` closes and the loop below ends.
+
+        // producer: `job_tx` moves into this task. when the task ends, it's dropped,
+        // the jobs channel closes, and the workers' `for job in jobs` loops end.
+        spawn {
+            for i, path in paths {
+                job_tx <- .thumbnail{id: "thumb_{i}", path}
+            }
+        }
+
+        // collector: the scope body runs alongside its tasks.
+        // `stats` is only touched here, by one task, so no mutex is needed.
+        for res in res_rx {
+            match res {
+                ok(t) => {
+                    try io.write_file(thumb_path(t.id, t.format), t.bytes)
+                    stats.ok += 1
+                }
+                err(e) => {
+                    stats.failed += 1
+                    stats.errors.append("{e}")
+                }
+            }
+        }
+    }
+
+    print("{stats.ok} ok, {stats.failed} failed in {time.since(start):.2}")
+    for e in stats.errors {
+        print("  - {e}")
+    }
+}
